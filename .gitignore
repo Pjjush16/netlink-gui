@@ -1,0 +1,19 @@
+# Binaries
+netlink-gui
+netlink-gui-linux
+netlink-gui-windows.exe
+netlink-gui-macos
+netlink-gui.apk
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
