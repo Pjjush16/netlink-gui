@@ -6,133 +6,112 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
 
 jobs:
-  build-linux:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            output: netlink-gui-linux
+          - os: windows-latest
+            platform: windows
+            output: netlink-gui-windows.exe
+          - os: macos-latest
+            platform: macos
+            output: netlink-gui-macos
+    runs-on: ${{ matrix.os }}
+    
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-      
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgl1-mesa-dev xorg-dev
-      
-      - name: Build Linux
-        run: |
-          CGO_ENABLED=1 go build -ldflags="-s -w" -o netlink-gui-linux
-        env:
-          GOPROXY: https://goproxy.cn,direct
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: netlink-gui-linux
-          path: netlink-gui-linux
+    - uses: actions/checkout@v4
 
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-      
-      - name: Build Windows
-        shell: cmd
-        run: |
-          set CGO_ENABLED=1
-          set GOOS=windows
-          set GOARCH=amd64
-          go build -ldflags="-s -w -H=windowsgui" -o netlink-gui-windows.exe
-        env:
-          GOPROXY: https://goproxy.cn,direct
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: netlink-gui-windows
-          path: netlink-gui-windows.exe
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
 
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-      
-      - name: Build macOS
-        run: |
-          CGO_ENABLED=1 go build -ldflags="-s -w" -o netlink-gui-macos
-        env:
-          GOPROXY: https://goproxy.cn,direct
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: netlink-gui-macos
-          path: netlink-gui-macos
+    - name: Install Linux dependencies
+      if: matrix.platform == 'linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1-mesa-dev xorg-dev
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Build
+      shell: bash
+      run: |
+        if [ "${{ matrix.platform }}" == "windows" ]; then
+          go build -ldflags="-s -w -H=windowsgui" -o ${{ matrix.output }} .
+        else
+          go build -ldflags="-s -w" -o ${{ matrix.output }} .
+        fi
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.platform }}
+        path: ${{ matrix.output }}
 
   build-android:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-      
-      - name: Set up Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r25c
-      
-      - name: Install fyne CLI
-        run: |
-          go install fyne.io/fyne/v2/cmd/fyne@latest
-        env:
-          GOPROXY: https://goproxy.cn,direct
-      
-      - name: Build Android APK
-        run: |
-          export PATH=$PATH:$(go env GOPATH)/bin
-          fyne package -os android -name "NetLink" -icon Icon.png
-        env:
-          GOPROXY: https://goproxy.cn,direct
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: netlink-gui-android
-          path: netlink-gui.apk
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+
+    - name: Install Android dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1-mesa-dev xorg-dev
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Install fyne
+      run: go install fyne.io/fyne/v2/cmd/fyne@latest
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Install Android NDK
+      run: |
+        sdkmanager --install "ndk;25.2.9519653"
+        echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+
+    - name: Build Android APK
+      run: |
+        fyne package -os android -appID com.netlink.gui -icon Icon.png -name "NetLink"
+        mv netlink-gui.apk netlink-gui-android.apk || true
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: android
+        path: netlink-gui-android.apk
 
   release:
-    needs: [build-linux, build-windows, build-macos, build-android]
+    needs: [build, build-android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-      
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            netlink-gui-linux/netlink-gui-linux
-            netlink-gui-windows/netlink-gui-windows.exe
-            netlink-gui-macos/netlink-gui-macos
-            netlink-gui-android/netlink-gui.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          linux/netlink-gui-linux
+          windows/netlink-gui-windows.exe
+          macos/netlink-gui-macos
+          android/netlink-gui-android.apk
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
