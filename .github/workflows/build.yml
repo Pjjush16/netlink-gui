@@ -88,7 +88,10 @@ jobs:
     - name: Build Android APK
       run: |
         fyne package -os android -appID com.netlink.gui -icon Icon.png -name "NetLink"
-        mv netlink-gui.apk netlink-gui-android.apk || true
+        # Find the generated APK file (fyne uses the name parameter)
+        ls -la *.apk || true
+        mv NetLink.apk netlink-gui-android.apk || mv *.apk netlink-gui-android.apk || true
+        ls -la netlink-gui-android.apk
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
