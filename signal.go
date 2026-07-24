@@ -32,25 +32,35 @@ func NewSignalClient(url, nodeID string) *SignalClient {
 	}
 }
 
-func (s *SignalClient) Register(vip, addr, mode string) error {
-	info := NodeInfo{
-		NodeID:     s.nodeID,
-		VirtualIP:  vip,
-		PublicAddr: addr,
-		Mode:       mode,
-		Online:     true,
+func (s *SignalClient) Register(addr, mode string) (string, error) {
+	info := map[string]string{
+		"node_id":     s.nodeID,
+		"public_addr": addr,
+		"mode":        mode,
 	}
 	data, _ := json.Marshal(info)
 	resp, err := s.client.Post(s.serverURL+"?action=register", "application/json", bytes.NewReader(data))
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("register failed: %d %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("register failed: %d %s", resp.StatusCode, string(body))
 	}
-	return nil
+
+	var result struct {
+		VirtualIP string `json:"virtual_ip"`
+		Status    string `json:"status"`
+	}
+	json.Unmarshal(body, &result)
+
+	if result.VirtualIP == "" {
+		return "", fmt.Errorf("server did not return virtual_ip")
+	}
+
+	return result.VirtualIP, nil
 }
 
 func (s *SignalClient) Lookup(vip string) (*NodeInfo, error) {
@@ -81,8 +91,10 @@ func (s *SignalClient) List() ([]NodeInfo, error) {
 }
 
 func (s *SignalClient) Heartbeat() error {
-	req, _ := http.NewRequest("POST", s.serverURL+"?action=heartbeat", nil)
-	req.Header.Set("X-Node-ID", s.nodeID)
+	info := map[string]string{"node_id": s.nodeID}
+	data, _ := json.Marshal(info)
+	req, _ := http.NewRequest("POST", s.serverURL+"?action=heartbeat", bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return err
@@ -92,8 +104,10 @@ func (s *SignalClient) Heartbeat() error {
 }
 
 func (s *SignalClient) Deregister() error {
-	req, _ := http.NewRequest("POST", s.serverURL+"?action=deregister", nil)
-	req.Header.Set("X-Node-ID", s.nodeID)
+	info := map[string]string{"node_id": s.nodeID}
+	data, _ := json.Marshal(info)
+	req, _ := http.NewRequest("POST", s.serverURL+"?action=deregister", bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return err

@@ -79,21 +79,21 @@ func (c *EngineConfig) Save() error {
 }
 
 type Engine struct {
-	Config    *EngineConfig
-	State     EngineState
-	Router    *Router
-	Transport Transport
-	KeyPair   *KeyPair
-	Cipher    *Cipher
-	Signal    *SignalClient
-	Proxy     *SOCKS5Proxy
+	Config     *EngineConfig
+	State      EngineState
+	Router     *Router
+	Transport  Transport
+	KeyPair    *KeyPair
+	Cipher     *Cipher
+	Signal     *SignalClient
+	Proxy      *SOCKS5Proxy
 	PublicAddr *PublicAddress
 	LocalAddr  string
 	VirtualIP  net.IP
-	Peers     []NodeInfo
-	BytesSent uint64
-	BytesRecv uint64
-	Latency   time.Duration
+	Peers      []NodeInfo
+	BytesSent  uint64
+	BytesRecv  uint64
+	Latency    time.Duration
 
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -143,19 +143,7 @@ func (e *Engine) Connect() error {
 		return err
 	}
 
-	// Allocate virtual IP
-	if e.Config.VirtualIP == "" {
-		ip, err := e.Router.AllocateVIP()
-		if err != nil {
-			e.setError(err)
-			return err
-		}
-		e.Config.VirtualIP = ip.String()
-		e.Config.Save()
-	}
-	e.VirtualIP = net.ParseIP(e.Config.VirtualIP)
-
-	// Start transport
+	// Start transport FIRST (needed for local addr)
 	mode := e.Config.Mode
 	var t Transport
 
@@ -183,16 +171,59 @@ func (e *Engine) Connect() error {
 		e.LocalAddr = addr.String()
 	}
 
-	// STUN discovery
-	go func() {
-		pub, err := DiscoverSTUN(e.LocalAddr, 5*time.Second)
-		if err == nil {
-			e.mu.Lock()
-			e.PublicAddr = pub
-			e.mu.Unlock()
-			e.notify()
+	// STUN discovery (wait for result)
+	pub, stunErr := DiscoverSTUN(e.LocalAddr, 5*time.Second)
+	if stunErr == nil {
+		e.mu.Lock()
+		e.PublicAddr = pub
+		e.mu.Unlock()
+	}
+
+	// Register with signal server and GET VIP from server
+	if e.Config.SignalURL != "" {
+		e.Signal = NewSignalClient(e.Config.SignalURL, e.Config.NodeID)
+
+		addr := e.LocalAddr
+		if e.PublicAddr != nil {
+			addr = e.PublicAddr.String()
 		}
-	}()
+
+		// Server assigns VIP — don't use local allocation
+		assignedVIP, regErr := e.Signal.Register(addr, t.Mode())
+		if regErr != nil {
+			fmt.Printf("Warning: signal register failed: %v\n", regErr)
+			// Fallback to local allocation
+			if e.Config.VirtualIP == "" {
+				ip, err := e.Router.AllocateVIP()
+				if err != nil {
+					e.setError(err)
+					return err
+				}
+				e.Config.VirtualIP = ip.String()
+				e.Config.Save()
+			}
+		} else {
+			// Use server-assigned VIP
+			e.Config.VirtualIP = assignedVIP
+			e.Config.Save()
+		}
+
+		go e.heartbeatLoop()
+		go e.peerDiscoveryLoop()
+	} else {
+		// No signal server — local allocation only
+		if e.Config.VirtualIP == "" {
+			ip, err := e.Router.AllocateVIP()
+			if err != nil {
+				e.setError(err)
+				return err
+			}
+			e.Config.VirtualIP = ip.String()
+			e.Config.Save()
+		}
+	}
+
+	e.VirtualIP = net.ParseIP(e.Config.VirtualIP)
 
 	// Start SOCKS5 proxy
 	e.Proxy = NewSOCKS5(e.Config.ProxyAddr, func(vip net.IP, port uint16) (net.Conn, error) {
@@ -203,19 +234,6 @@ func (e *Engine) Connect() error {
 		return net.DialTimeout("tcp", route.PeerAddr.String(), 10*time.Second)
 	})
 	e.Proxy.Start()
-
-	// Signal client
-	if e.Config.SignalURL != "" {
-		e.Signal = NewSignalClient(e.Config.SignalURL, e.Config.NodeID)
-		addr := e.LocalAddr
-		if e.PublicAddr != nil {
-			addr = e.PublicAddr.String()
-		}
-		e.Signal.Register(e.Config.VirtualIP, addr, t.Mode())
-
-		go e.heartbeatLoop()
-		go e.peerDiscoveryLoop()
-	}
 
 	// Packet handler
 	go e.packetLoop()
