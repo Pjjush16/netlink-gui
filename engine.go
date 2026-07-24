@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/user"
@@ -79,14 +80,38 @@ func (c *EngineConfig) Save() error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// PeerConnection tracks a peer's connection state
 type PeerConnection struct {
 	Info      NodeInfo
-	Direct    bool      // true = P2P direct, false = relay only
-	Addr      net.Addr  // resolved peer address for P2P
+	Direct    bool
+	Addr      net.Addr
 	LastSeen  time.Time
 	BytesSent uint64
 	BytesRecv uint64
+
+	// For relay: active connections waiting for data
+	relayConns   []net.Conn
+	relayConnsMu sync.Mutex
+}
+
+func (pc *PeerConnection) AddRelayConn(conn net.Conn) {
+	pc.relayConnsMu.Lock()
+	pc.relayConns = append(pc.relayConns, conn)
+	pc.relayConnsMu.Unlock()
+}
+
+func (pc *PeerConnection) DeliverRelayData(data []byte) {
+	pc.relayConnsMu.Lock()
+	defer pc.relayConnsMu.Unlock()
+
+	for i := len(pc.relayConns) - 1; i >= 0; i-- {
+		conn := pc.relayConns[i]
+		_, err := conn.Write(data)
+		if err != nil {
+			// Remove dead connection
+			pc.relayConns = append(pc.relayConns[:i], pc.relayConns[i+1:]...)
+			conn.Close()
+		}
+	}
 }
 
 type Engine struct {
@@ -95,22 +120,26 @@ type Engine struct {
 	Router     *Router
 	Transport  Transport
 	KeyPair    *KeyPair
-	Cipher     *Cipher
 	Signal     *SignalClient
 	Proxy      *SOCKS5Proxy
 	PublicAddr *PublicAddress
 	LocalAddr  string
 	VirtualIP  net.IP
 	Peers      []NodeInfo
-	PeerConns  map[string]*PeerConnection // VIP -> connection
+	PeerConns  map[string]*PeerConnection
 	BytesSent  uint64
 	BytesRecv  uint64
 	Latency    time.Duration
+
+	// UDP listener for P2P (separate from main transport if main is TCP)
+	p2pListener *net.UDPConn
+	p2pAddr     string
 
 	ctx      context.Context
 	cancel   context.CancelFunc
 	mu       sync.RWMutex
 	onUpdate func()
+	logFunc  func(string)
 }
 
 func NewEngine(cfg *EngineConfig) *Engine {
@@ -128,9 +157,19 @@ func (e *Engine) SetOnUpdate(fn func()) {
 	e.onUpdate = fn
 }
 
+func (e *Engine) SetLogFunc(fn func(string)) {
+	e.logFunc = fn
+}
+
 func (e *Engine) notify() {
 	if e.onUpdate != nil {
 		e.onUpdate()
+	}
+}
+
+func (e *Engine) log(msg string) {
+	if e.logFunc != nil {
+		e.logFunc(msg)
 	}
 }
 
@@ -156,7 +195,23 @@ func (e *Engine) Connect() error {
 		return err
 	}
 
-	// Start transport
+	// ===== ALWAYS start a UDP listener for P2P =====
+	// Even if signal server uses HTTP, P2P data goes over UDP
+	p2pAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:0")
+	if err != nil {
+		e.setError(err)
+		return err
+	}
+	e.p2pListener, err = net.ListenUDP("udp", p2pAddr)
+	if err != nil {
+		e.log(fmt.Sprintf("P2P UDP listener failed: %v", err))
+	} else {
+		e.p2pAddr = e.p2pListener.LocalAddr().String()
+		e.log(fmt.Sprintf("P2P UDP listener: %s", e.p2pAddr))
+		go e.p2pReceiveLoop()
+	}
+
+	// Start main transport (TCP for signal, or UDP)
 	mode := e.Config.Mode
 	var t Transport
 
@@ -190,12 +245,24 @@ func (e *Engine) Connect() error {
 		e.mu.Lock()
 		e.PublicAddr = pub
 		e.mu.Unlock()
+		e.log(fmt.Sprintf("STUN public addr: %s", pub))
+	} else {
+		e.log(fmt.Sprintf("STUN failed: %v", stunErr))
+	}
+
+	// Also try STUN on P2P listener
+	if e.p2pAddr != "" {
+		p2pPub, err := DiscoverSTUN(e.p2pAddr, 5*time.Second)
+		if err == nil {
+			e.log(fmt.Sprintf("P2P STUN public addr: %s", p2pPub))
+		}
 	}
 
 	// Register with signal server
 	if e.Config.SignalURL != "" {
 		e.Signal = NewSignalClient(e.Config.SignalURL, e.Config.NodeID)
 
+		// Register with our P2P UDP address so peers can reach us directly
 		addr := e.LocalAddr
 		if e.PublicAddr != nil {
 			addr = e.PublicAddr.String()
@@ -203,12 +270,12 @@ func (e *Engine) Connect() error {
 
 		assignedVIP, regErr := e.Signal.Register(addr, t.Mode())
 		if regErr != nil {
-			fmt.Printf("Warning: signal register failed: %v\n", regErr)
+			e.log(fmt.Sprintf("Signal register failed: %v", regErr))
 			if e.Config.VirtualIP == "" {
-				ip, err := e.Router.AllocateVIP()
-				if err != nil {
-					e.setError(err)
-					return err
+				ip, allocErr := e.Router.AllocateVIP()
+				if allocErr != nil {
+					e.setError(allocErr)
+					return allocErr
 				}
 				e.Config.VirtualIP = ip.String()
 				e.Config.Save()
@@ -216,6 +283,7 @@ func (e *Engine) Connect() error {
 		} else {
 			e.Config.VirtualIP = assignedVIP
 			e.Config.Save()
+			e.log(fmt.Sprintf("Registered with VIP: %s", assignedVIP))
 		}
 
 		go e.heartbeatLoop()
@@ -223,10 +291,10 @@ func (e *Engine) Connect() error {
 		go e.relayReceiveLoop()
 	} else {
 		if e.Config.VirtualIP == "" {
-			ip, err := e.Router.AllocateVIP()
-			if err != nil {
-				e.setError(err)
-				return err
+			ip, allocErr := e.Router.AllocateVIP()
+			if allocErr != nil {
+				e.setError(allocErr)
+				return allocErr
 			}
 			e.Config.VirtualIP = ip.String()
 			e.Config.Save()
@@ -240,8 +308,9 @@ func (e *Engine) Connect() error {
 		return e.dialVirtualIP(vip, port)
 	})
 	e.Proxy.Start()
+	e.log(fmt.Sprintf("SOCKS5 proxy: %s", e.Proxy.Addr()))
 
-	// Direct UDP packet handler
+	// Main transport packet handler
 	go e.directPacketLoop()
 
 	e.mu.Lock()
@@ -259,27 +328,65 @@ func (e *Engine) dialVirtualIP(vip net.IP, port uint16) (net.Conn, error) {
 	pc, exists := e.PeerConns[vipStr]
 	e.mu.RUnlock()
 
+	// Try P2P direct first
 	if exists && pc.Direct && pc.Addr != nil {
-		// P2P direct connection available
-		conn, err := net.DialTimeout("tcp", pc.Addr.String(), 5*time.Second)
+		e.log(fmt.Sprintf("P2P direct -> %s via %s", vipStr, pc.Addr))
+		conn, err := net.DialTimeout("udp", pc.Addr.String(), 5*time.Second)
 		if err == nil {
 			return conn, nil
 		}
+		e.log(fmt.Sprintf("P2P direct failed: %v, falling back to relay", err))
 	}
 
-	// Fallback: use relay (virtual pipe)
+	// Relay fallback
+	e.log(fmt.Sprintf("Relay -> %s", vipStr))
+
 	serverConn, clientConn := net.Pipe()
 
-	go e.relayForwardLoop(vipStr, serverConn)
+	// Register this connection so relay data can be delivered
+	e.mu.Lock()
+	if !exists {
+		pc = &PeerConnection{
+			Info: NodeInfo{VirtualIP: vipStr},
+		}
+		e.PeerConns[vipStr] = pc
+	}
+	e.mu.Unlock()
+
+	pc.AddRelayConn(serverConn)
+
+	// Start reading from clientConn and sending via relay
+	go func() {
+		defer clientConn.Close()
+		buf := make([]byte, 16384)
+		for {
+			select {
+			case <-e.ctx.Done():
+				return
+			default:
+			}
+			clientConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := clientConn.Read(buf)
+			if err != nil {
+				return
+			}
+			if e.Signal != nil && pc.Info.NodeID != "" {
+				encoded := base64.StdEncoding.EncodeToString(buf[:n])
+				e.Signal.Relay(pc.Info.NodeID, encoded)
+				e.mu.Lock()
+				e.BytesSent += uint64(n)
+				e.mu.Unlock()
+			}
+		}
+	}()
 
 	return clientConn, nil
 }
 
-// relayForwardLoop reads from local connection and sends via relay
-func (e *Engine) relayForwardLoop(targetVIP string, conn net.Conn) {
-	defer conn.Close()
-	buf := make([]byte, 16384)
+// ===== P2P UDP Listener =====
 
+func (e *Engine) p2pReceiveLoop() {
+	buf := make([]byte, 65536)
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -287,33 +394,136 @@ func (e *Engine) relayForwardLoop(targetVIP string, conn net.Conn) {
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		n, err := conn.Read(buf)
+		e.p2pListener.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, remoteAddr, err := e.p2pListener.ReadFromUDP(buf)
 		if err != nil {
-			return
+			continue
 		}
 
-		if e.Signal == nil {
-			return
+		data := make([]byte, n)
+		copy(data, buf[:n])
+
+		e.mu.Lock()
+		e.BytesRecv += uint64(n)
+		e.mu.Unlock()
+
+		// Parse packet
+		pkt, err := DecodePacket(data)
+		if err != nil {
+			continue
 		}
 
-		// Find peer's node_id from VIP
-		e.mu.RLock()
-		pc, exists := e.PeerConns[targetVIP]
-		e.mu.RUnlock()
-
-		if !exists {
-			return
-		}
-
-		encoded := base64.StdEncoding.EncodeToString(buf[:n])
-		e.Signal.Relay(pc.Info.NodeID, encoded)
+		e.handleP2PPacket(pkt, remoteAddr)
 	}
 }
 
-// relayReceiveLoop polls signal server for relay messages
+func (e *Engine) handleP2PPacket(pkt *Packet, remoteAddr *net.UDPAddr) {
+	switch pkt.Header.Type {
+	case MsgHandshake:
+		// Peer wants P2P connection - respond with ack
+		vipStr := pkt.Header.SrcVIP.To4().String()
+		e.log(fmt.Sprintf("P2P handshake from %s at %s", vipStr, remoteAddr))
+
+		e.mu.Lock()
+		pc, exists := e.PeerConns[vipStr]
+		if !exists {
+			pc = &PeerConnection{}
+			e.PeerConns[vipStr] = pc
+		}
+		pc.Direct = true
+		pc.Addr = remoteAddr
+		pc.LastSeen = time.Now()
+		e.mu.Unlock()
+
+		// Send ack back
+		ack := &Packet{
+			Header: Header{
+				Type:   MsgHandshakeAck,
+				Seq:    pkt.Header.Seq,
+				SrcVIP: e.VirtualIP,
+				DstVIP: pkt.Header.SrcVIP,
+			},
+		}
+		e.p2pListener.WriteToUDP(ack.Encode(), remoteAddr)
+		e.notify()
+
+	case MsgHandshakeAck:
+		vipStr := pkt.Header.SrcVIP.To4().String()
+		e.log(fmt.Sprintf("P2P ack from %s", vipStr))
+
+		e.mu.Lock()
+		if pc, exists := e.PeerConns[vipStr]; exists {
+			pc.Direct = true
+			pc.LastSeen = time.Now()
+		}
+		e.mu.Unlock()
+		e.notify()
+
+	case MsgPing:
+		pong := &Packet{
+			Header: Header{
+				Type:   MsgPong,
+				Seq:    pkt.Header.Seq,
+				SrcVIP: e.VirtualIP,
+				DstVIP: pkt.Header.SrcVIP,
+			},
+		}
+		e.p2pListener.WriteToUDP(pong.Encode(), remoteAddr)
+
+	case MsgPong:
+		e.mu.Lock()
+		e.Latency = time.Since(time.Unix(0, int64(pkt.Header.Seq)))
+		e.mu.Unlock()
+	}
+}
+
+// sendP2PHandshake sends handshake packets to a peer for hole punching
+func (e *Engine) sendP2PHandshake(peer NodeInfo) {
+	if e.p2pListener == nil {
+		return
+	}
+
+	var addr *net.UDPAddr
+	// Try public_addr first (STUN-discovered)
+	if peer.PublicAddr != "" {
+		addr, _ = net.ResolveUDPAddr("udp", peer.PublicAddr)
+	}
+	// Try real_addr (from HTTP headers)
+	if addr == nil && peer.RealAddr != "" {
+		addr, _ = net.ResolveUDPAddr("udp", peer.RealAddr)
+	}
+	if addr == nil {
+		e.log(fmt.Sprintf("No address for peer %s", peer.NodeID))
+		return
+	}
+
+	e.log(fmt.Sprintf("P2P punch -> %s (%s)", peer.NodeID, addr))
+
+	handshake := &Packet{
+		Header: Header{
+			Type:   MsgHandshake,
+			Seq:    uint64(time.Now().UnixNano()),
+			SrcVIP: e.VirtualIP,
+			DstVIP: net.ParseIP(peer.VirtualIP),
+		},
+	}
+	data := handshake.Encode()
+
+	// Send 5 times with short intervals for better NAT traversal
+	for i := 0; i < 5; i++ {
+		_, err := e.p2pListener.WriteToUDP(data, addr)
+		if err != nil {
+			e.log(fmt.Sprintf("P2P send error: %v", err))
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// ===== Relay =====
+
 func (e *Engine) relayReceiveLoop() {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -338,17 +548,27 @@ func (e *Engine) relayReceiveLoop() {
 
 				e.mu.Lock()
 				e.BytesRecv += uint64(len(data))
+
+				// Find the peer connection from the sender's node_id
+				var targetPC *PeerConnection
+				for _, pc := range e.PeerConns {
+					if pc.Info.NodeID == msg.From {
+						targetPC = pc
+						break
+					}
+				}
 				e.mu.Unlock()
 
-				// TODO: deliver data to the appropriate local connection
-				// For now, just track the stats
-				_ = data
+				if targetPC != nil {
+					targetPC.DeliverRelayData(data)
+				}
 			}
 		}
 	}
 }
 
-// directPacketLoop handles packets received via direct UDP/TCP transport
+// ===== Direct transport packet handler =====
+
 func (e *Engine) directPacketLoop() {
 	for {
 		select {
@@ -359,121 +579,21 @@ func (e *Engine) directPacketLoop() {
 				e.mu.Lock()
 				e.BytesRecv += uint64(len(pkt.Data))
 				e.mu.Unlock()
-
-				// Try to parse and handle the packet
 				e.handleIncomingPacket(pkt)
 			}
 		}
 	}
 }
 
-// handleIncomingPacket processes a received packet
 func (e *Engine) handleIncomingPacket(pkt IncomingPacket) {
 	p, err := DecodePacket(pkt.Data)
 	if err != nil {
 		return
 	}
-
-	switch p.Header.Type {
-	case MsgPing:
-		// Reply with pong
-		pong := &Packet{
-			Header: Header{
-				Type:   MsgPong,
-				Seq:    p.Header.Seq,
-				SrcVIP: e.VirtualIP,
-				DstVIP: p.Header.SrcVIP,
-			},
-		}
-		e.Transport.Send(pkt.Addr, pong.Encode())
-
-	case MsgPong:
-		// Update latency
-		e.mu.Lock()
-		e.Latency = time.Since(time.Unix(0, int64(p.Header.Seq)))
-		e.mu.Unlock()
-
-	case MsgHandshake:
-		// Peer wants P2P connection
-		e.mu.Lock()
-		vipStr := p.Header.SrcVIP.To4().String()
-		pc, exists := e.PeerConns[vipStr]
-		if !exists {
-			pc = &PeerConnection{}
-			e.PeerConns[vipStr] = pc
-		}
-		pc.Direct = true
-		pc.Addr = pkt.Addr
-		pc.LastSeen = time.Now()
-		e.mu.Unlock()
-
-		// Send handshake ack
-		ack := &Packet{
-			Header: Header{
-				Type:   MsgHandshakeAck,
-				Seq:    p.Header.Seq,
-				SrcVIP: e.VirtualIP,
-				DstVIP: p.Header.SrcVIP,
-			},
-		}
-		e.Transport.Send(pkt.Addr, ack.Encode())
-
-	case MsgHandshakeAck:
-		// Peer confirmed P2P
-		e.mu.Lock()
-		vipStr := p.Header.SrcVIP.To4().String()
-		if pc, exists := e.PeerConns[vipStr]; exists {
-			pc.Direct = true
-			pc.LastSeen = time.Now()
-		}
-		e.mu.Unlock()
-	}
+	e.handleP2PPacket(p, nil)
 }
 
-// tryP2P attempts P2P hole punching to a peer
-func (e *Engine) tryP2P(peer NodeInfo) {
-	vipStr := peer.VirtualIP
-
-	// Resolve peer address
-	var addr net.Addr
-	if peer.PublicAddr != "" {
-		addr, _ = net.ResolveUDPAddr("udp", peer.PublicAddr)
-	}
-	if addr == nil && peer.RealAddr != "" {
-		addr, _ = net.ResolveUDPAddr("udp", peer.RealAddr)
-	}
-
-	// Store peer connection (relay-only initially)
-	e.mu.Lock()
-	e.PeerConns[vipStr] = &PeerConnection{
-		Info:     peer,
-		Direct:   false,
-		Addr:     addr,
-		LastSeen: time.Now(),
-	}
-	e.mu.Unlock()
-
-	if addr == nil || e.Transport == nil {
-		return // Can't try P2P without address
-	}
-
-	// Send handshake packets to try hole punching
-	handshake := &Packet{
-		Header: Header{
-			Type:   MsgHandshake,
-			Seq:    uint64(time.Now().UnixNano()),
-			SrcVIP: e.VirtualIP,
-			DstVIP: net.ParseIP(vipStr),
-		},
-	}
-	data := handshake.Encode()
-
-	// Send multiple times to increase chance of NAT traversal
-	for i := 0; i < 3; i++ {
-		e.Transport.Send(addr, data)
-		time.Sleep(200 * time.Millisecond)
-	}
-}
+// ===== Loops =====
 
 func (e *Engine) Disconnect() {
 	e.cancel()
@@ -485,6 +605,9 @@ func (e *Engine) Disconnect() {
 	}
 	if e.Transport != nil {
 		e.Transport.Close()
+	}
+	if e.p2pListener != nil {
+		e.p2pListener.Close()
 	}
 	e.mu.Lock()
 	e.State = StateDisconnected
@@ -515,7 +638,7 @@ func (e *Engine) heartbeatLoop() {
 }
 
 func (e *Engine) peerDiscoveryLoop() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -531,7 +654,6 @@ func (e *Engine) peerDiscoveryLoop() {
 				continue
 			}
 
-			// Filter out self
 			var filtered []NodeInfo
 			for _, p := range peers {
 				if p.NodeID != e.Config.NodeID && p.VirtualIP != e.Config.VirtualIP {
@@ -539,11 +661,11 @@ func (e *Engine) peerDiscoveryLoop() {
 
 					// Try P2P to new peers
 					e.mu.RLock()
-					_, exists := e.PeerConns[p.VirtualIP]
+					pc, exists := e.PeerConns[p.VirtualIP]
 					e.mu.RUnlock()
 
-					if !exists {
-						go e.tryP2P(p)
+					if !exists || !pc.Direct {
+						go e.sendP2PHandshake(p)
 					}
 				}
 			}
@@ -567,6 +689,9 @@ func (e *Engine) GetStatus() map[string]string {
 		"传输模式": e.Transport_mode(),
 		"本地地址": e.LocalAddr,
 	}
+	if e.p2pAddr != "" {
+		status["P2P地址"] = e.p2pAddr
+	}
 	if e.PublicAddr != nil {
 		status["公网地址"] = e.PublicAddr.String()
 	}
@@ -574,7 +699,6 @@ func (e *Engine) GetStatus() map[string]string {
 		status["SOCKS5"] = e.Proxy.Addr().String()
 	}
 
-	// Count direct vs relay peers
 	direct := 0
 	relay := 0
 	for _, pc := range e.PeerConns {
@@ -608,3 +732,6 @@ func Hostname() string {
 	}
 	return h
 }
+
+// suppress unused import
+var _ = io.EOF
