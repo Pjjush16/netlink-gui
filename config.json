@@ -1,0 +1,8 @@
+{
+  "node_id": "cloud-server",
+  "virtual_ip": "10.0.0.1",
+  "signal_server": "https://netlink.42web.io/netlink-signal-server.php",
+  "listen_addr": "0.0.0.0:9090",
+  "proxy_addr": "127.0.0.1:1080",
+  "private_key": ""
+}

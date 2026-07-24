@@ -195,6 +195,10 @@ func (g *GUI) buildUI() {
 		g.addLog(fmt.Sprintf("发送文件 %s -> %s", filePath.Text, fileTarget.Text))
 	})
 
+	// Browser
+	browser := NewBrowser(g.window, g.engine)
+	browserTab := browser.CreateTab()
+
 	// Tabs
 	tabs := container.NewAppTabs(
 		container.NewTabItem("状态", container.NewVBox(
@@ -206,6 +210,7 @@ func (g *GUI) buildUI() {
 			widget.NewLabel("在线节点列表"),
 			g.peersTbl,
 		)),
+		container.NewTabItem("浏览器", browserTab),
 		container.NewTabItem("日志", g.logTxt),
 		container.NewTabItem("文件", container.NewVBox(
 			widget.NewLabel("目标虚拟IP:"),
