@@ -1,4 +1,4 @@
-// signal.go - Signaling server client
+// signal.go - Signaling server client with relay support
 package main
 
 import (
@@ -14,8 +14,21 @@ type NodeInfo struct {
 	NodeID     string `json:"node_id"`
 	VirtualIP  string `json:"virtual_ip"`
 	PublicAddr string `json:"public_addr"`
+	RealAddr   string `json:"real_addr"`
 	Mode       string `json:"mode"`
 	Online     bool   `json:"online"`
+}
+
+type RelayMessage struct {
+	From string `json:"from"`
+	Data string `json:"data"` // base64 encoded
+	Time int64  `json:"time"`
+}
+
+type RelayPollResponse struct {
+	Status   string         `json:"status"`
+	Messages []RelayMessage `json:"messages"`
+	Count    int            `json:"count"`
 }
 
 type SignalClient struct {
@@ -52,7 +65,6 @@ func (s *SignalClient) Register(addr, mode string) (string, error) {
 
 	var result struct {
 		VirtualIP string `json:"virtual_ip"`
-		Status    string `json:"status"`
 	}
 	json.Unmarshal(body, &result)
 
@@ -93,9 +105,7 @@ func (s *SignalClient) List() ([]NodeInfo, error) {
 func (s *SignalClient) Heartbeat() error {
 	info := map[string]string{"node_id": s.nodeID}
 	data, _ := json.Marshal(info)
-	req, _ := http.NewRequest("POST", s.serverURL+"?action=heartbeat", bytes.NewReader(data))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
+	resp, err := s.client.Post(s.serverURL+"?action=heartbeat", "application/json", bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -106,12 +116,44 @@ func (s *SignalClient) Heartbeat() error {
 func (s *SignalClient) Deregister() error {
 	info := map[string]string{"node_id": s.nodeID}
 	data, _ := json.Marshal(info)
-	req, _ := http.NewRequest("POST", s.serverURL+"?action=deregister", bytes.NewReader(data))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
+	resp, err := s.client.Post(s.serverURL+"?action=deregister", "application/json", bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
 	resp.Body.Close()
 	return nil
+}
+
+// Relay sends data to a peer through the signal server.
+func (s *SignalClient) Relay(toNodeID, base64Data string) error {
+	msg := map[string]string{
+		"from": s.nodeID,
+		"to":   toNodeID,
+		"data": base64Data,
+	}
+	data, _ := json.Marshal(msg)
+	resp, err := s.client.Post(s.serverURL+"?action=relay", "application/json", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("relay failed: %d %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// RelayPoll checks for incoming relay messages.
+func (s *SignalClient) RelayPoll() ([]RelayMessage, error) {
+	url := fmt.Sprintf("%s?action=relay_poll&node_id=%s", s.serverURL, s.nodeID)
+	resp, err := s.client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var result RelayPollResponse
+	json.Unmarshal(body, &result)
+	return result.Messages, nil
 }
